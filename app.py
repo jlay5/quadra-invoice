@@ -51,7 +51,7 @@ def parse_optus(pdf):
             continue
 
         # Pattern like "0403061668 on $60 Business Mobile Plus M2M"
-        matches = re.findall(r"(04\d{8}) on \$(\d+).+?(Business Mobile.+?M2M)", text)
+        matches = re.findall(r"(04\d{8}) on \$([\d,]*\.\d{2}|\d+)\s+(.+?M2M)", text)
         for m in matches:
             number, raw_price, plan = m
             # Look for final monthly charge (after discounts)
@@ -76,8 +76,8 @@ def parse_vodafone(pdf):
         if not text:
             continue
 
-        # Pattern: "04XXXXXXXX on $XX.XX <PlanName>"
-        matches = re.findall(r"(04\d{8}) on \$([\d,]*\.\d{2})\s+(.+?)(?:\s|$)", text)
+        # Pattern: "04XXXXXXXX on $XX.XX <PlanName>" or "$60"
+        matches = re.findall(r"(04\d{8}) on \$([\d,]*\.\d{2}|\d+)\s+(.+?)(?:\s|$)", text)
         for m in matches:
             number, amt_str, plan = m
             try:
@@ -86,63 +86,6 @@ def parse_vodafone(pdf):
                 spend_incl = None
 
             # Optional override: look for "Total Monthly Charges" for that number
-            override = re.search(rf"{number}.*?\$([\d,]*\.\d{{2}})", full_text)
+            override = re.search(rf"{number}.*?\$([\d,]*\.\d{2})", full_text)
             if override:
                 try:
-                    spend_incl = float(override.group(1).replace(",", ""))
-                except:
-                    pass
-
-            spend_excl = round(spend_incl / 1.1, 2) if spend_incl is not None else None
-
-            data.append({
-                "Mobile Number": number,
-                "Plan Name": plan.strip(),
-                "Spend Excl GST": spend_excl,
-                "Spend Incl GST": spend_incl
-            })
-
-    return pd.DataFrame(data)
-
-
-# ---------------- UNIVERSAL ----------------
-def extract_invoice_data(file):
-    with pdfplumber.open(file) as pdf:
-        full_text = " ".join([p.extract_text() or "" for p in pdf.pages])
-        if "Telstra Limited" in full_text:
-            return parse_telstra(pdf), "Telstra"
-        elif "Optus Billing Services" in full_text or "Optus" in full_text:
-            return parse_optus(pdf), "Optus"
-        elif "Vodafone" in full_text or "Vodafone Pty" in full_text:
-            return parse_vodafone(pdf), "Vodafone"
-        else:
-            return pd.DataFrame(), "Unknown"
-
-
-if uploaded_file is not None:
-    df, provider = extract_invoice_data(uploaded_file)
-    if df.empty:
-        st.warning(f"No mobile data found. Provider detected: {provider}. Double-check invoice format.")
-    else:
-        st.success(f"✅ Extracted data from {provider} invoice")
-        st.dataframe(df)
-
-        # Excel download
-        towrite = BytesIO()
-        df.to_excel(towrite, index=False)
-        towrite.seek(0)
-        st.download_button(
-            label="📥 Download Excel",
-            data=towrite,
-            file_name="invoice_data.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-        # CSV download
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv,
-            file_name="invoice_data.csv",
-            mime="text/csv"
-        )
