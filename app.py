@@ -14,30 +14,35 @@ uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 # ---------------- TELSTRA ----------------
 def parse_telstra(pdf):
     data = []
+    current_number = None
+
     for page in pdf.pages:
         text = page.extract_text()
         if not text:
             continue
 
-        mobiles = re.findall(r"04\d{2}\s?\d{3}\s?\d{3}", text)
-        plans = re.findall(r"Business Mobile Plan[^\n]*", text)
-        spends = re.findall(r"\$?\d+\,?\d*\.\d{2}", text)
+        lines = text.splitlines()
+        for line in lines:
+            # Detect mobile number
+            mnum = re.search(r"Mobile (\d{4}\s?\d{3}\s?\d{3})", line)
+            if mnum:
+                current_number = mnum.group(1).replace(" ", "")
+                continue
 
-        for i, m in enumerate(mobiles):
-            plan = plans[i] if i < len(plans) else "Unknown"
-            spend_excl, spend_incl = None, None
-            if len(spends) >= (2*i + 2):
-                try:
-                    spend_excl = float(spends[2*i].replace(",", "").replace("$", ""))
-                    spend_incl = float(spends[2*i+1].replace(",", "").replace("$", ""))
-                except:
-                    pass
-            data.append({
-                "Mobile Number": m,
-                "Plan Name": plan.strip(),
-                "Spend Excl GST": spend_excl,
-                "Spend Incl GST": spend_incl,
-            })
+            # Detect plan + charges line
+            if "Business" in line and ("Plan" in line or "Bundle" in line):
+                # Example: "Business Mobile Plan Basic - 10 Sep to 09 Oct   $63.64   $70.00"
+                m = re.match(r"(.+?)\s+\$([\d,]*\.\d{2})\s+\$([\d,]*\.\d{2})", line)
+                if m and current_number:
+                    plan = m.group(1).strip()
+                    spend_excl = float(m.group(2).replace(",", ""))
+                    spend_incl = float(m.group(3).replace(",", ""))
+                    data.append({
+                        "Mobile Number": current_number,
+                        "Plan Name": plan,
+                        "Spend Excl GST": spend_excl,
+                        "Spend Incl GST": spend_incl,
+                    })
     return pd.DataFrame(data)
 
 
@@ -113,7 +118,7 @@ def parse_vodafone(pdf):
 def extract_invoice_data(file):
     with pdfplumber.open(file) as pdf:
         full_text = " ".join([p.extract_text() or "" for p in pdf.pages])
-        if "Telstra Limited" in full_text:
+        if "Telstra Limited" in full_text or "telstra.com" in full_text.lower():
             return parse_telstra(pdf), "Telstra"
         elif "Optus Billing Services" in full_text or "Optus" in full_text:
             return parse_optus(pdf), "Optus"
