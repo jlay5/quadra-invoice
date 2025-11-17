@@ -33,12 +33,13 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
     """
     Parse OCR'd Telstra invoice PDF and return one row per mobile service.
 
-    Strategy per page:
-    - Identify the mobile number from the header ("Mobile 04xx xxx xxx").
-    - From the page text, read Call & Usage + Service summary totals.
-    - From the tables, sum WAP / Internet Vol(KB).
-    - From the tables, capture Origin values ONLY for
-      "Data usage overseas (GST FREE)" rows.
+    Rules (per Jlay's requirements):
+    - Use the summary text for Call & Usage + Service Charges totals.
+    - For WAP volume, ONLY sum the Vol(KB) column where the row belongs
+      to the 'Mobile WAP/Internet sessions' section in the itemised call details.
+    - For overseas countries, ONLY read the Location column for rows in the
+      'Data usage overseas (GST FREE)' section in the itemised call details.
+    - If no such rows exist for a mobile, Overseas Countries is left blank.
     """
     mobiles = defaultdict(lambda: {
         "National Direct Calls": 0,
@@ -61,7 +62,7 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
             text = page.extract_text() or ""
             lines = [ln.rstrip() for ln in text.splitlines()]
 
-            # ---------- Which mobile does this page belong to? ----------
+            # ---------- Identify which mobile this page belongs to ----------
             m_header = re.search(r"Mobile\s+([0-9 ]{8,15})", text)
             if not m_header:
                 continue  # skip pages without a mobile header
@@ -69,10 +70,9 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
             raw = m_header.group(1)
             digits = re.sub(r"\D", "", raw)
             mobile = digits[-10:] if len(digits) >= 10 else digits
-
             data = mobiles[mobile]
 
-            # ---------- Call & Usage + Service summaries (text) ----------
+            # ---------- Call & Usage + Service summaries (from text) ----------
             for l in lines:
                 l_stripped = l.strip()
 
@@ -133,7 +133,7 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                     except ValueError:
                         pass
 
-            # ---------- Tables: WAP KB + Overseas Countries ----------
+            # ---------- Tables: WAP Vol(KB) + Overseas Location ----------
             tables = page.extract_tables()
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
@@ -142,38 +142,58 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                 header = [(c or "").strip() for c in tbl[0]]
                 header_lower = [h.lower() for h in header]
 
-                # Find Vol(KB) column (for WAP volume)
+                # Identify key columns in this table
                 vol_idx = None
-                for idx, h in enumerate(header_lower):
-                    if ("vol" in h and "kb" in h) or h in {"kb", "vol", "volume"}:
-                        vol_idx = idx
-                        break
+                desc_idx = None
+                location_idx = None
 
-                # Find Origin column (for countries)
-                origin_idx = None
                 for idx, h in enumerate(header_lower):
-                    if "origin" in h:
-                        origin_idx = idx
-                        break
+                    # Vol(KB) column
+                    if "vol" in h and "kb" in h:
+                        vol_idx = idx
+                    # Description / Call Type / Number Dialled column
+                    if any(x in h for x in ["description", "call type", "number dialled", "number dialed"]):
+                        desc_idx = idx
+                    # Location column (for overseas)
+                    if "location" in h:
+                        location_idx = idx
+
+                # If there is no Vol(KB) column, this table is not useful for WAP/data
+                if vol_idx is None:
+                    # Still might be useful for Location if 'data usage overseas' rows exist
+                    pass
 
                 # Walk data rows
                 for row in tbl[1:]:
                     cells = [(c or "") for c in row]
                     cells_lower = [c.lower() for c in cells]
+                    row_text = " ".join(cells_lower)
 
-                    # WAP / internet sessions: detect by description
-                    if any("telstra.wap" in c or "telstra.internet" in c for c in cells_lower):
-                        if vol_idx is not None and vol_idx < len(cells):
-                            cell = cells[vol_idx].replace(",", "").strip()
-                            if cell.isdigit():
-                                data["Total WAP Volume (KB)"] += int(cell)
+                    # ---- WAP / Internet sessions: ONLY from WAP/Internet rows, Vol(KB) column ----
+                    if vol_idx is not None:
+                        # Determine if this row is part of Mobile WAP/Internet sessions
+                        # Typical pattern: description / number dialled contains 'wap' or 'internet' (e.g. telstra.wap)
+                        is_wap_row = False
+                        if desc_idx is not None and desc_idx < len(cells_lower):
+                            desc_cell = cells_lower[desc_idx]
+                            if "wap" in desc_cell or "internet" in desc_cell:
+                                is_wap_row = True
+                        else:
+                            # Fallback: any cell mentions wap/internet
+                            if "wap" in row_text or "internet" in row_text:
+                                is_wap_row = True
 
-                    # Overseas countries: ONLY from "Data usage overseas (GST FREE)" rows
-                    if any("data usage overseas" in c for c in cells_lower):
-                        if origin_idx is not None and origin_idx < len(cells):
-                            country = cells[origin_idx].strip()
-                            if country:
-                                data["Overseas Countries"].add(country)
+                        if is_wap_row:
+                            vol_cell = cells[vol_idx].replace(",", "").strip()
+                            if vol_cell.isdigit():
+                                data["Total WAP Volume (KB)"] += int(vol_cell)
+
+                    # ---- Overseas Countries: ONLY from data usage overseas (GST FREE) rows, Location column ----
+                    if "data usage overseas" in row_text and "gst free" in row_text:
+                        if location_idx is not None and location_idx < len(cells):
+                            location_val = cells[location_idx].strip()
+                            if location_val:
+                                data["Overseas Countries"].add(location_val)
 
     # ---------- Build final DataFrame ----------
     rows = []
@@ -214,6 +234,7 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
         )
 
     return df
+
 
 
 # ------------------ UI flow ------------------ #
