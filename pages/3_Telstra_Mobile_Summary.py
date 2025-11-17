@@ -33,11 +33,12 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
     """
     Parse OCR'd Telstra invoice PDF and return one row per mobile service.
 
-    Strategy:
-    - For each page, identify the mobile number from the header.
-    - Parse Call & Usage + Service Charges summaries from page text.
-    - Parse WAP / Internet Vol(KB) from itemised table using extract_tables().
-    - Aggregate across pages (some services span multiple pages).
+    Strategy per page:
+    - Identify the mobile number from the header ("Mobile 04xx xxx xxx").
+    - From the page text, read Call & Usage + Service summary totals.
+    - From the tables, sum WAP / Internet Vol(KB).
+    - From the tables, capture Origin values ONLY for
+      "Data usage overseas (GST FREE)" rows.
     """
     mobiles = defaultdict(lambda: {
         "National Direct Calls": 0,
@@ -60,20 +61,20 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
             text = page.extract_text() or ""
             lines = [ln.rstrip() for ln in text.splitlines()]
 
-            # -------- Determine which mobile this page belongs to --------
+            # ---------- Which mobile does this page belong to? ----------
             m_header = re.search(r"Mobile\s+([0-9 ]{8,15})", text)
             if not m_header:
-                # Page with no mobile header – skip
-                continue
+                continue  # skip pages without a mobile header
+
             raw = m_header.group(1)
             digits = re.sub(r"\D", "", raw)
             mobile = digits[-10:] if len(digits) >= 10 else digits
+
             data = mobiles[mobile]
 
-            # -------- Parse Call & Usage + Service summaries from text --------
+            # ---------- Call & Usage + Service summaries (text) ----------
             for l in lines:
                 l_stripped = l.strip()
-                low = l_stripped.lower()
 
                 # Call & Usage counts
                 m_nat = re.search(r"National Direct.*?(\d+)\s*calls", l_stripped)
@@ -113,7 +114,6 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                     try:
                         ex = float(m_tot_call.group(1))
                         inc = float(m_tot_call.group(2))
-                        # Add in case summary is split across pages
                         data["Total Call Charges (Excl GST)"] += ex
                         data["Total Call Charges (Incl GST)"] += inc
                     except ValueError:
@@ -133,45 +133,56 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                     except ValueError:
                         pass
 
-                # Overseas countries from any line (summary or detail)
-                for c in KNOWN_COUNTRIES:
-                    if c.lower() in low:
-                        data["Overseas Countries"].add(c)
-
-            # -------- Parse WAP / Internet Vol(KB) from tables --------
+            # ---------- Tables: WAP KB + Overseas Countries ----------
             tables = page.extract_tables()
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
                     continue
 
-                # Normalise header row
                 header = [(c or "").strip() for c in tbl[0]]
-                # Look for a column that looks like Vol(KB) / KB / Vol
+                header_lower = [h.lower() for h in header]
+
+                # Find Vol(KB) column (for WAP volume)
                 vol_idx = None
-                for idx, h in enumerate(header):
-                    h_low = h.lower()
-                    if "vol" in h_low and "kb" in h_low:
-                        vol_idx = idx
-                        break
-                    if h_low in {"kb", "vol", "volume"}:
+                for idx, h in enumerate(header_lower):
+                    if ("vol" in h and "kb" in h) or h in {"kb", "vol", "volume"}:
                         vol_idx = idx
                         break
 
-                if vol_idx is None:
-                    continue  # not a data-volume table
+                # Find Origin column (for countries)
+                origin_idx = None
+                for idx, h in enumerate(header_lower):
+                    if "origin" in h:
+                        origin_idx = idx
+                        break
 
-                # Sum all numeric values in that column
+                # Walk data rows
                 for row in tbl[1:]:
-                    if vol_idx >= len(row):
-                        continue
-                    cell = (row[vol_idx] or "").replace(",", "").strip()
-                    if cell.isdigit():
-                        data["Total WAP Volume (KB)"] += int(cell)
+                    cells = [(c or "") for c in row]
+                    cells_lower = [c.lower() for c in cells]
 
-    # -------- Build DataFrame --------
+                    # WAP / internet sessions: detect by description
+                    if any("telstra.wap" in c or "telstra.internet" in c for c in cells_lower):
+                        if vol_idx is not None and vol_idx < len(cells):
+                            cell = cells[vol_idx].replace(",", "").strip()
+                            if cell.isdigit():
+                                data["Total WAP Volume (KB)"] += int(cell)
+
+                    # Overseas countries: ONLY from "Data usage overseas (GST FREE)" rows
+                    if any("data usage overseas" in c for c in cells_lower):
+                        if origin_idx is not None and origin_idx < len(cells):
+                            country = cells[origin_idx].strip()
+                            if country:
+                                data["Overseas Countries"].add(country)
+
+    # ---------- Build final DataFrame ----------
     rows = []
     for mobile, d in mobiles.items():
-        countries = ", ".join(sorted(d["Overseas Countries"])) if d["Overseas Countries"] else ""
+        countries_str = (
+            ", ".join(sorted(d["Overseas Countries"]))
+            if d["Overseas Countries"]
+            else ""
+        )
         total_ex = d["Total Call Charges (Excl GST)"] + d["Total Service Charges (Excl GST)"]
         total_inc = d["Total Call Charges (Incl GST)"] + d["Total Service Charges (Incl GST)"]
 
@@ -189,7 +200,7 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
             "Total Service Charges (Excl GST)": d["Total Service Charges (Excl GST)"],
             "Total Service Charges (Incl GST)": d["Total Service Charges (Incl GST)"],
             "Total WAP Volume (KB)": d["Total WAP Volume (KB)"],
-            "Overseas Countries": countries,
+            "Overseas Countries": countries_str,
             "Total Spend per Mobile (Excl GST)": total_ex,
             "Total Spend per Mobile (Incl GST)": total_inc,
         })
@@ -203,7 +214,6 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
         )
 
     return df
-
 
 
 # ------------------ UI flow ------------------ #
