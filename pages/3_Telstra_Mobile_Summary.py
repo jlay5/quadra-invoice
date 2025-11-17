@@ -1,5 +1,6 @@
 import re
 import io
+from collections import defaultdict
 
 import pdfplumber
 import pandas as pd
@@ -29,128 +30,169 @@ KNOWN_COUNTRIES = ["Fiji", "Nauru", "Chile", "Singapore", "USA", "UK"]
 
 
 def parse_telstra_pdf(file_obj) -> pd.DataFrame:
-    """Parse OCR'd Telstra invoice PDF and return one row per mobile service."""
-    rows = []
+    """
+    Parse OCR'd Telstra invoice PDF and return one row per mobile service.
+
+    Strategy:
+    - For each page, identify the mobile number from the header.
+    - Parse Call & Usage + Service Charges summaries from page text.
+    - Parse WAP / Internet Vol(KB) from itemised table using extract_tables().
+    - Aggregate across pages (some services span multiple pages).
+    """
+    mobiles = defaultdict(lambda: {
+        "National Direct Calls": 0,
+        "SMS (Mobile Originated)": 0,
+        "Enhanced SMS": 0,
+        "Call Diversion Calls": 0,
+        "Calls Made Overseas": 0,
+        "Calls Received Overseas": 0,
+        "Overseas Data Sessions": 0,
+        "Total Call Charges (Excl GST)": 0.0,
+        "Total Call Charges (Incl GST)": 0.0,
+        "Total Service Charges (Excl GST)": 0.0,
+        "Total Service Charges (Incl GST)": 0.0,
+        "Total WAP Volume (KB)": 0,
+        "Overseas Countries": set(),
+    })
 
     with pdfplumber.open(file_obj) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            lines = text.splitlines()
+            lines = [ln.rstrip() for ln in text.splitlines()]
 
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
+            # -------- Determine which mobile this page belongs to --------
+            m_header = re.search(r"Mobile\s+([0-9 ]{8,15})", text)
+            if not m_header:
+                # Page with no mobile header – skip
+                continue
+            raw = m_header.group(1)
+            digits = re.sub(r"\D", "", raw)
+            mobile = digits[-10:] if len(digits) >= 10 else digits
+            data = mobiles[mobile]
 
-                # Header line like: "Mobile 0400 936296"
-                m_header = re.match(r"Mobile\s+(\d{4}\s?\d{3}\s?\d{3})", line)
-                if not m_header:
-                    i += 1
+            # -------- Parse Call & Usage + Service summaries from text --------
+            for l in lines:
+                l_stripped = l.strip()
+                low = l_stripped.lower()
+
+                # Call & Usage counts
+                m_nat = re.search(r"National Direct.*?(\d+)\s*calls", l_stripped)
+                if m_nat:
+                    data["National Direct Calls"] = int(m_nat.group(1))
+
+                m_sms = re.search(r"Mobile Originated SMS.*?(\d+)\s*calls", l_stripped)
+                if m_sms:
+                    data["SMS (Mobile Originated)"] = int(m_sms.group(1))
+
+                m_enh = re.search(r"Mobile Enhanced SMS.*?(\d+)\s*calls?", l_stripped)
+                if m_enh:
+                    data["Enhanced SMS"] = int(m_enh.group(1))
+
+                m_div = re.search(r"Call Diversion.*?(\d+)\s*calls", l_stripped)
+                if m_div:
+                    data["Call Diversion Calls"] = int(m_div.group(1))
+
+                m_calls_os = re.search(r"Calls made O/S.*?(\d+)\s*calls", l_stripped)
+                if m_calls_os:
+                    data["Calls Made Overseas"] = int(m_calls_os.group(1))
+
+                m_calls_rec = re.search(r"Calls received O/S.*?(\d+)\s*calls", l_stripped)
+                if m_calls_rec:
+                    data["Calls Received Overseas"] = int(m_calls_rec.group(1))
+
+                m_data_os = re.search(r"Data Usage Overseas.*?(\d+)\s*calls?", l_stripped)
+                if m_data_os:
+                    data["Overseas Data Sessions"] = int(m_data_os.group(1))
+
+                # Total call charges
+                m_tot_call = re.search(
+                    r"Total call charges\s*\$?\s*([\d.]+)\s*\$?\s*([\d.]+)",
+                    l_stripped,
+                )
+                if m_tot_call:
+                    try:
+                        ex = float(m_tot_call.group(1))
+                        inc = float(m_tot_call.group(2))
+                        # Add in case summary is split across pages
+                        data["Total Call Charges (Excl GST)"] += ex
+                        data["Total Call Charges (Incl GST)"] += inc
+                    except ValueError:
+                        pass
+
+                # Total service charges
+                m_svc_tot = re.search(
+                    r"Total service charges\s*\$?\s*([\d.]+)\s*\$?\s*([\d.]+)",
+                    l_stripped,
+                )
+                if m_svc_tot:
+                    try:
+                        ex = float(m_svc_tot.group(1))
+                        inc = float(m_svc_tot.group(2))
+                        data["Total Service Charges (Excl GST)"] += ex
+                        data["Total Service Charges (Incl GST)"] += inc
+                    except ValueError:
+                        pass
+
+                # Overseas countries from any line (summary or detail)
+                for c in KNOWN_COUNTRIES:
+                    if c.lower() in low:
+                        data["Overseas Countries"].add(c)
+
+            # -------- Parse WAP / Internet Vol(KB) from tables --------
+            tables = page.extract_tables()
+            for tbl in tables:
+                if not tbl or len(tbl) < 2:
                     continue
 
-                mobile = m_header.group(1).replace(" ", "")
-
-                # Initialise metrics for this mobile
-                nat = sms = enh = div = calls_os = calls_os_rec = os_data = 0
-                total_call_ex = total_call_inc = 0.0
-                svc_ex = svc_inc = 0.0
-                wap_kb = 0
-                countries = set()
-
-                j = i + 1
-                while j < len(lines):
-                    l = lines[j].strip()
-
-                    # Stop when we hit the next mobile block
-                    if l.startswith("Mobile ") and j != i:
+                # Normalise header row
+                header = [(c or "").strip() for c in tbl[0]]
+                # Look for a column that looks like Vol(KB) / KB / Vol
+                vol_idx = None
+                for idx, h in enumerate(header):
+                    h_low = h.lower()
+                    if "vol" in h_low and "kb" in h_low:
+                        vol_idx = idx
+                        break
+                    if h_low in {"kb", "vol", "volume"}:
+                        vol_idx = idx
                         break
 
-                    # Skip itemised detail block entirely
-                    if l.startswith("Itemised call details"):
-                        j += 1
+                if vol_idx is None:
+                    continue  # not a data-volume table
+
+                # Sum all numeric values in that column
+                for row in tbl[1:]:
+                    if vol_idx >= len(row):
                         continue
+                    cell = (row[vol_idx] or "").replace(",", "").strip()
+                    if cell.isdigit():
+                        data["Total WAP Volume (KB)"] += int(cell)
 
-                    # ----- Call & Usage summaries -----
-                    m_nat = re.search(r"National Direct.*?(\d+)\s*calls", l)
-                    if m_nat:
-                        nat = int(m_nat.group(1))
+    # -------- Build DataFrame --------
+    rows = []
+    for mobile, d in mobiles.items():
+        countries = ", ".join(sorted(d["Overseas Countries"])) if d["Overseas Countries"] else ""
+        total_ex = d["Total Call Charges (Excl GST)"] + d["Total Service Charges (Excl GST)"]
+        total_inc = d["Total Call Charges (Incl GST)"] + d["Total Service Charges (Incl GST)"]
 
-                    m_sms = re.search(r"Mobile Originated SMS.*?(\d+)\s*calls", l)
-                    if m_sms:
-                        sms = int(m_sms.group(1))
-
-                    m_enh = re.search(r"Mobile Enhanced SMS.*?(\d+)\s*calls?", l)
-                    if m_enh:
-                        enh = int(m_enh.group(1))
-
-                    m_div = re.search(r"Call Diversion.*?(\d+)\s*calls", l)
-                    if m_div:
-                        div = int(m_div.group(1))
-
-                    m_calls_os = re.search(r"Calls made O/S.*?(\d+)\s*calls", l)
-                    if m_calls_os:
-                        calls_os = int(m_calls_os.group(1))
-
-                    m_calls_rec = re.search(r"Calls received O/S.*?(\d+)\s*calls", l)
-                    if m_calls_rec:
-                        calls_os_rec = int(m_calls_rec.group(1))
-
-                    m_data_os = re.search(r"Data Usage Overseas.*?(\d+)\s*calls?", l)
-                    if m_data_os:
-                        os_data = int(m_data_os.group(1))
-
-                    # Total call charges line
-                    m_tot_call = re.search(
-                        r"Total call charges\s*\$?\s*([\d.]+)\s*\$?\s*([\d.]+)", l
-                    )
-                    if m_tot_call:
-                        total_call_ex = float(m_tot_call.group(1))
-                        total_call_inc = float(m_tot_call.group(2))
-
-                    # ----- Service charge summary -----
-                    m_svc_tot = re.search(
-                        r"Total service charges\s*\$?\s*([\d.]+)\s*\$?\s*([\d.]+)", l
-                    )
-                    if m_svc_tot:
-                        svc_ex = float(m_svc_tot.group(1))
-                        svc_inc = float(m_svc_tot.group(2))
-
-                    # ----- WAP / mobile internet sessions -----
-                    if ("telstra.wap" in l.lower() or "telstra.internet" in l.lower()):
-                        m_vol = re.search(r"(\d+)\s*$", l)
-                        if m_vol:
-                            wap_kb += int(m_vol.group(1))
-
-                    # ----- Overseas countries -----
-                    for c in KNOWN_COUNTRIES:
-                        if c.lower() in l.lower():
-                            countries.add(c)
-
-                    j += 1
-
-                rows.append(
-                    {
-                        "Mobile Number": mobile,
-                        "National Direct Calls": nat,
-                        "SMS (Mobile Originated)": sms,
-                        "Enhanced SMS": enh,
-                        "Call Diversion Calls": div,
-                        "Calls Made Overseas": calls_os,
-                        "Calls Received Overseas": calls_os_rec,
-                        "Overseas Data Sessions": os_data,
-                        "Total Call Charges (Excl GST)": total_call_ex,
-                        "Total Call Charges (Incl GST)": total_call_inc,
-                        "Total Service Charges (Excl GST)": svc_ex,
-                        "Total Service Charges (Incl GST)": svc_inc,
-                        "Total WAP Volume (KB)": wap_kb,
-                        "Overseas Countries": ", ".join(sorted(countries)),
-                        "Total Spend per Mobile (Excl GST)": total_call_ex + svc_ex,
-                        "Total Spend per Mobile (Incl GST)": total_call_inc + svc_inc,
-                    }
-                )
-
-                i = j
-
-            i += 1
+        rows.append({
+            "Mobile Number": mobile,
+            "National Direct Calls": d["National Direct Calls"],
+            "SMS (Mobile Originated)": d["SMS (Mobile Originated)"],
+            "Enhanced SMS": d["Enhanced SMS"],
+            "Call Diversion Calls": d["Call Diversion Calls"],
+            "Calls Made Overseas": d["Calls Made Overseas"],
+            "Calls Received Overseas": d["Calls Received Overseas"],
+            "Overseas Data Sessions": d["Overseas Data Sessions"],
+            "Total Call Charges (Excl GST)": d["Total Call Charges (Excl GST)"],
+            "Total Call Charges (Incl GST)": d["Total Call Charges (Incl GST)"],
+            "Total Service Charges (Excl GST)": d["Total Service Charges (Excl GST)"],
+            "Total Service Charges (Incl GST)": d["Total Service Charges (Incl GST)"],
+            "Total WAP Volume (KB)": d["Total WAP Volume (KB)"],
+            "Overseas Countries": countries,
+            "Total Spend per Mobile (Excl GST)": total_ex,
+            "Total Spend per Mobile (Incl GST)": total_inc,
+        })
 
     df = pd.DataFrame(rows)
 
@@ -161,6 +203,7 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
         )
 
     return df
+
 
 
 # ------------------ UI flow ------------------ #
