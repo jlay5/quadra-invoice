@@ -133,16 +133,17 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                     except ValueError:
                         pass
 
-            # ---------- Tables: WAP Vol(KB) + Overseas Location ----------
+                        # ---------- Tables: WAP Vol(KB) + Overseas Location ----------
             tables = page.extract_tables()
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
                     continue
 
+                # Normalise header row
                 header = [(c or "").strip() for c in tbl[0]]
                 header_lower = [h.lower() for h in header]
 
-                # Identify key columns in this table
+                # Work out key columns
                 vol_idx = None
                 desc_idx = None
                 location_idx = None
@@ -151,49 +152,62 @@ def parse_telstra_pdf(file_obj) -> pd.DataFrame:
                     # Vol(KB) column
                     if "vol" in h and "kb" in h:
                         vol_idx = idx
-                    # Description / Call Type / Number Dialled column
-                    if any(x in h for x in ["description", "call type", "number dialled", "number dialed"]):
+                    # Description / number dialled / call type column
+                    if any(x in h for x in ["description", "call type", "number dialled", "number dialed", "number dialled"]):
                         desc_idx = idx
                     # Location column (for overseas)
                     if "location" in h:
                         location_idx = idx
 
-                # If there is no Vol(KB) column, this table is not useful for WAP/data
-                if vol_idx is None:
-                    # Still might be useful for Location if 'data usage overseas' rows exist
-                    pass
+                # If we don't even have a description column, it's unlikely to be one
+                # of the detailed call tables we care about
+                if desc_idx is None:
+                    continue
 
-                # Walk data rows
+                # First pass over rows to classify the table
+                is_overseas_data_table = False
+                is_wap_table = False
+
                 for row in tbl[1:]:
                     cells = [(c or "") for c in row]
                     cells_lower = [c.lower() for c in cells]
                     row_text = " ".join(cells_lower)
 
-                    # ---- WAP / Internet sessions: ONLY from WAP/Internet rows, Vol(KB) column ----
-                    if vol_idx is not None:
-                        # Determine if this row is part of Mobile WAP/Internet sessions
-                        # Typical pattern: description / number dialled contains 'wap' or 'internet' (e.g. telstra.wap)
-                        is_wap_row = False
-                        if desc_idx is not None and desc_idx < len(cells_lower):
-                            desc_cell = cells_lower[desc_idx]
-                            if "wap" in desc_cell or "internet" in desc_cell:
-                                is_wap_row = True
-                        else:
-                            # Fallback: any cell mentions wap/internet
-                            if "wap" in row_text or "internet" in row_text:
-                                is_wap_row = True
-
-                        if is_wap_row:
-                            vol_cell = cells[vol_idx].replace(",", "").strip()
-                            if vol_cell.isdigit():
-                                data["Total WAP Volume (KB)"] += int(vol_cell)
-
-                    # ---- Overseas Countries: ONLY from data usage overseas (GST FREE) rows, Location column ----
+                    # If any row mentions "data usage overseas (gst free)", this is the
+                    # Data usage overseas table
                     if "data usage overseas" in row_text and "gst free" in row_text:
+                        is_overseas_data_table = True
+                        break
+
+                if not is_overseas_data_table:
+                    # If any row in this table has "wap" or "internet" in the description/
+                    # call-type column, treat this table as the Mobile WAP/Internet sessions table.
+                    for row in tbl[1:]:
+                        cells = [(c or "") for c in row]
+                        if desc_idx < len(cells):
+                            desc_cell = (cells[desc_idx] or "").lower()
+                            if "wap" in desc_cell or "internet" in desc_cell:
+                                is_wap_table = True
+                                break
+
+                # Second pass: act based on the table type
+                for row in tbl[1:]:
+                    cells = [(c or "") for c in row]
+                    cells_lower = [c.lower() for c in cells]
+                    row_text = " ".join(cells_lower)
+
+                    # ---- WAP volume: ONLY from WAP table & Vol(KB) column ----
+                    if is_wap_table and vol_idx is not None and vol_idx < len(cells):
+                        vol_cell = cells[vol_idx].replace(",", "").strip()
+                        if vol_cell.isdigit():
+                            data["Total WAP Volume (KB)"] += int(vol_cell)
+
+                    # ---- Overseas Countries: ONLY from Data usage overseas (GST FREE) table & Location column ----
+                    if is_overseas_data_table and "data usage overseas" in row_text and "gst free" in row_text:
                         if location_idx is not None and location_idx < len(cells):
-                            location_val = cells[location_idx].strip()
-                            if location_val:
-                                data["Overseas Countries"].add(location_val)
+                            loc_val = cells[location_idx].strip()
+                            if loc_val:
+                                data["Overseas Countries"].add(loc_val)
 
     # ---------- Build final DataFrame ----------
     rows = []
